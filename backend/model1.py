@@ -31,77 +31,124 @@ intents_data = {
 # 2️⃣ Connect to MongoDB
 # =======================================================
 client = MongoClient("mongodb://localhost:27017/")
-db = client["a_chatbot"]
+db = client["cathychatbot"]
 intents_collection = db["intents"]
 feedback_collection = db["feedback"]
 
 # =======================================================
-# 3️⃣ Auto-create collection & insert initial intents
+# 3️⃣ Insert initial intents if not present
 # =======================================================
 for intent, examples in intents_data.items():
     if intents_collection.count_documents({"intent": intent}) == 0:
         intents_collection.insert_one({"intent": intent, "examples": examples})
 
 # =======================================================
-# 4️⃣ Load Sentence Transformer Model
+# 4️⃣ Load Sentence Transformer
 # =======================================================
 semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
 
 # =======================================================
-# 5️⃣ Load all examples from DB and compute embeddings
+# 5️⃣ Load examples and compute embeddings
 # =======================================================
 def load_examples():
-    example_texts = []
-    example_labels = []
+    texts, labels = [], []
     for doc in intents_collection.find():
         for text in doc["examples"]:
-            example_texts.append(text)
-            example_labels.append(doc["intent"])
-    return example_texts, example_labels
+            texts.append(text)
+            labels.append(doc["intent"])
+    return texts, labels
 
 example_texts, example_labels = load_examples()
 example_embeddings = semantic_model.encode(example_texts, convert_to_tensor=True)
 
-# =======================================================
-# 6️⃣ Prediction Function
-# =======================================================
-def predict_airline_intent(user_text, similarity_threshold=0.55):
-    user_emb = semantic_model.encode(user_text, convert_to_tensor=True)
-    cosine_scores = util.cos_sim(user_emb, example_embeddings)
-    max_score, idx = torch.max(cosine_scores, dim=1)
-    max_score = max_score.item()
-    predicted_intent = example_labels[idx.item()]
-    if max_score < similarity_threshold:
-        return "Irrelevant"
-    return predicted_intent
+# Precompute intent-wise embeddings for multi-intent prediction
+def load_intent_embeddings():
+    embeddings = {}
+    for doc in intents_collection.find():
+        examples = doc["examples"]
+        if examples:
+            embeddings[doc["intent"]] = semantic_model.encode(examples, convert_to_tensor=True)
+    return embeddings
+
+intent_embeddings = load_intent_embeddings()
 
 # =======================================================
-# 7️⃣ Update DB for new user feedback
+# 6️⃣ Multi-intent prediction
 # =======================================================
-def update_intent_in_db(user_text, correct_intent):
-    # Add the new example to intent examples if not exists
+
+# =======================================================
+# Recompute embeddings for all intents
+# =======================================================
+def update_embeddings_for_all_intents():
+    """
+    Recompute embeddings for all intents after feedback update
+    """
+    global intent_embeddings
+    intent_embeddings = {}
+    for doc in intents_collection.find():
+        examples = doc["examples"]
+        if examples:
+            intent_embeddings[doc["intent"]] = semantic_model.encode(examples, convert_to_tensor=True)
+    print("✅ Recomputed embeddings for all intents.")
+
+
+
+def predict_multiple_intents(user_text, similarity_threshold=0.6, top_k=3):
+    """
+    Returns multiple relevant intents based on max similarity per intent.
+    Automatically filters out weakly related intents.
+    """
+    global intent_embeddings  # Make sure we use the updated embeddings
+    user_emb = semantic_model.encode(user_text, convert_to_tensor=True)
+    intent_scores = {}
+
+    # Compute max similarity for each intent
+    for intent, example_embs in intent_embeddings.items():
+        scores = util.cos_sim(user_emb, example_embs)
+        intent_scores[intent] = torch.max(scores).item()
+
+    # ✅ Filter out low-confidence intents
+    relevant_intents = {
+        intent: score for intent, score in intent_scores.items() if score >= similarity_threshold
+    }
+
+    # ✅ Sort by score descending
+    sorted_intents = sorted(relevant_intents.items(), key=lambda x: x[1], reverse=True)
+
+    # ✅ Pick top_k results
+    predicted_intents = [intent for intent, _ in sorted_intents[:top_k]]
+
+    # ✅ Handle case where only one strong match exists
+    if len(predicted_intents) == 0:
+        predicted_intents = ["Irrelevant"]
+
+    return predicted_intents
+
+# =======================================================
+# 7️⃣ Update DB & embeddings after feedback
+# =======================================================
+def update_intent(user_text, correct_intent):
     intents_collection.update_one(
         {"intent": correct_intent},
         {"$addToSet": {"examples": user_text}},
         upsert=True
     )
-    # Reload embeddings
-    global example_texts, example_labels, example_embeddings
+    # Update all embeddings immediately
+    global example_texts, example_labels, example_embeddings, intent_embeddings
     example_texts, example_labels = load_examples()
     example_embeddings = semantic_model.encode(example_texts, convert_to_tensor=True)
-    print(f"✅ Updated intent '{correct_intent}' in MongoDB and embeddings.")
+    intent_embeddings = load_intent_embeddings()
+    print(f"✅ Updated intent '{correct_intent}' and embeddings.")
 
 def store_feedback(user_text, predicted_intent, correct_intent):
-    feedback_entry = {
+    feedback_collection.insert_one({
         "user_text": user_text,
         "predicted_intent": predicted_intent,
         "correct_intent": correct_intent
-    }
-    feedback_collection.insert_one(feedback_entry)
-    print("✅ Feedback stored in MongoDB")
+    })
 
 # =======================================================
-# 8️⃣ Simple responses (can be extended)
+# 8️⃣ Responses
 # =======================================================
 responses = {
     "Cancel Trip": "I can help you cancel your flight. Please provide your booking details.",
@@ -129,7 +176,7 @@ def get_response(intent):
     return responses.get(intent, "Hmm... I didn’t understand that.")
 
 # =======================================================
-# 9️⃣ Chat Function (Ask feedback every time)
+# 9️⃣ Chat function
 # =======================================================
 def chat():
     print("✈ Airline Support Bot (type 'exit' to quit)")
@@ -138,22 +185,44 @@ def chat():
         if user_text.lower() == "exit":
             break
 
-        intent = predict_airline_intent(user_text)
-        print(f"Bot: {get_response(intent)}")
-        print(f"(Predicted Intent: {intent})")
+        predicted_intents = predict_multiple_intents(user_text)
+        print(f"Classification: {', '.join(predicted_intents)}")
 
-        # Always ask for feedback
-        feedback = input("Was that correct? (yes/no): ").lower()
+        for intent in predicted_intents:
+            print(f"Bot ({intent}): {get_response(intent)}")
+
+        feedback = input("Was this classification correct? (yes/no): ").lower()
         if feedback == "no":
-            correct_intent = input("Enter correct intent: ").strip()
-        else:
-            correct_intent = intent
+            correct_input = input("Enter correct intent(s), comma separated: ").strip()
+            correct_intents = [ci.strip() for ci in correct_input.split(",")]
+            # List of all allowed intents
+            allowed_intents = list(intents_data.keys())
 
-        # Store feedback and update DB
-        store_feedback(user_text, intent, correct_intent)
-        update_intent_in_db(user_text, correct_intent)
+            # Validate each intent
+            valid_intents = []
+            for ci in correct_intents:
+                if ci not in allowed_intents:
+                    print(f"❌ Intent '{ci}' is not recognized. It must be one of the predefined intents.")
+                else:
+                    valid_intents.append(ci)
+
+            # If none of the intents are valid, skip update
+            if not valid_intents:
+                print("⚠ No valid intents provided. Skipping update.")
+            else:
+                # Update DB for valid intents
+                for correct in valid_intents:
+                    update_intent(user_text, correct)
+
+                # Recompute embeddings
+                update_embeddings_for_all_intents()
+
+                # Store feedback
+                for predicted, correct in zip(predicted_intents, valid_intents):
+                    store_feedback(user_text, predicted, correct)
 
 # =======================================================
 # 10️⃣ Run chatbot
 # =======================================================
-chat()
+if __name__ == "__main__":
+    chat()

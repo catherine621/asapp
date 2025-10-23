@@ -1,10 +1,12 @@
 import streamlit as st
+st.set_page_config(page_title="Airline Chatbot", page_icon="✈️", layout="centered")
+
 from sentence_transformers import SentenceTransformer, util
 import torch
 from pymongo import MongoClient
 
 # =======================================================
-# 1️⃣ Connect to MongoDB
+# 1️⃣ MongoDB Connection
 # =======================================================
 client = MongoClient("mongodb://localhost:27017/")
 db = client["a_chatbot"]
@@ -12,7 +14,7 @@ intents_collection = db["intents"]
 feedback_collection = db["feedback"]
 
 # =======================================================
-# 2️⃣ Initialize intents if DB empty
+# 2️⃣ Default Intent Examples (Bootstrap DB)
 # =======================================================
 intents_data = {
     "Cancel Trip": ["I want to cancel my flight", "Please cancel my booking", "Cancel my ticket"],
@@ -41,59 +43,32 @@ for intent, examples in intents_data.items():
         intents_collection.insert_one({"intent": intent, "examples": examples})
 
 # =======================================================
-# 3️⃣ Load Sentence Transformer model
+# 3️⃣ Load Model
 # =======================================================
-semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
+model = SentenceTransformer('all-MiniLM-L6-v2', device="cpu")
 
 # =======================================================
-# 4️⃣ Load examples and compute embeddings
+# 4️⃣ Predict Intent Function
 # =======================================================
-def load_examples():
-    texts, labels = [], []
+def predict_intents(user_text, threshold=0.6, top_k=2):
+    user_emb = model.encode(user_text, convert_to_tensor=True)
+    intent_scores = {}
+
     for doc in intents_collection.find():
-        for text in doc["examples"]:
-            texts.append(text)
-            labels.append(doc["intent"])
-    return texts, labels
+        intent = doc["intent"]
+        examples = doc["examples"]
+        if not examples:
+            continue
+        ex_emb = model.encode(examples, convert_to_tensor=True)
+        score = torch.max(util.cos_sim(user_emb, ex_emb)).item()
+        intent_scores[intent] = score
 
-example_texts, example_labels = load_examples()
-example_embeddings = semantic_model.encode(example_texts, convert_to_tensor=True)
-
-# =======================================================
-# 5️⃣ Prediction function
-# =======================================================
-def predict_intent(user_text, threshold=0.55):
-    user_emb = semantic_model.encode(user_text, convert_to_tensor=True)
-    scores = util.cos_sim(user_emb, example_embeddings)
-    max_score, idx = torch.max(scores, dim=1)
-    max_score = max_score.item()
-    predicted = example_labels[idx.item()]
-    if max_score < threshold:
-        predicted = "Irrelevant"
-    return predicted
+    relevant = {i: s for i, s in intent_scores.items() if s >= threshold}
+    sorted_intents = sorted(relevant.items(), key=lambda x: x[1], reverse=True)
+    return [i for i, _ in sorted_intents[:top_k]] if sorted_intents else ["Irrelevant"]
 
 # =======================================================
-# 6️⃣ Update MongoDB and embeddings
-# =======================================================
-def update_intent_db(user_text, correct_intent):
-    intents_collection.update_one(
-        {"intent": correct_intent},
-        {"$addToSet": {"examples": user_text}},
-        upsert=True
-    )
-    global example_texts, example_labels, example_embeddings
-    example_texts, example_labels = load_examples()
-    example_embeddings = semantic_model.encode(example_texts, convert_to_tensor=True)
-
-def store_feedback(user_text, predicted_intent, correct_intent):
-    feedback_collection.insert_one({
-        "user_text": user_text,
-        "predicted_intent": predicted_intent,
-        "correct_intent": correct_intent
-    })
-
-# =======================================================
-# 7️⃣ Responses
+# 5️⃣ Responses
 # =======================================================
 responses = {
     "Cancel Trip": "I can help you cancel your flight. Please provide your booking details.",
@@ -117,47 +92,67 @@ responses = {
     "Irrelevant": "🤔 This seems unrelated to airline queries."
 }
 
-def get_response(intent):
-    return responses.get(intent, "Hmm... I didn’t understand that.")
+# =======================================================
+# 6️⃣ DB Feedback Functions
+# =======================================================
+def store_feedback(user_text, predicted, correct):
+    feedback_collection.insert_one({
+        "user_text": user_text,
+        "predicted": predicted,
+        "correct": correct
+    })
+
+def update_intent_db(user_text, intent):
+    intents_collection.update_one(
+        {"intent": intent},
+        {"$addToSet": {"examples": user_text}},
+        upsert=True
+    )
 
 # =======================================================
-# 8️⃣ Streamlit UI
+# 7️⃣ Streamlit UI
 # =======================================================
-st.set_page_config(page_title="Airline Chatbot", page_icon="✈️")
-st.title("✈ Airline Support Bot")
+st.title("✈️ Airline Support Chatbot")
+st.markdown("Ask about your flight, baggage, cancellation, or travel info below 👇")
 
-# Chat history
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-# User input
-user_input = st.text_input("You:", "")
+user_input = st.text_input("💬 Type your message:")
 
 if user_input:
-    predicted_intent = predict_intent(user_input)
-    response = get_response(predicted_intent)
+    predicted = predict_intents(user_input)
+    st.session_state.chat_history.append({
+        "user": user_input,
+        "predicted": predicted
+    })
 
-    # Show bot response
-    st.session_state.chat_history.append(("You", user_input))
-    st.session_state.chat_history.append(("Bot", f"{response} (Intent: {predicted_intent})"))
+# --- Show conversation ---
+for chat in st.session_state.chat_history:
+    st.markdown(f"**You:** {chat['user']}")
+    st.markdown(f"**Classification:** {', '.join(chat['predicted'])}")
 
-    # Ask for feedback using radio buttons
-    feedback = st.radio("Was this correct?", ("Yes", "No"), key=user_input)
+    for intent in chat["predicted"]:
+        st.markdown(f"**Bot ({intent}):** {responses[intent]}")
+
+    # --- Feedback section ---
+    st.markdown(f"Was this classification correct?")
+    fb_key = f"fb_{chat['user']}"
+    feedback = st.radio("", ["Yes", "No"], key=fb_key, horizontal=True, label_visibility="collapsed")
 
     if feedback == "No":
-        correct_intent = st.selectbox("Select correct intent:", list(intents_data.keys()), key="correct_"+user_input)
+        correct_intent = st.selectbox(
+            f"Select correct intent for: '{chat['user']}'",
+            list(intents_data.keys()),
+            key=f"sel_{chat['user']}"
+        )
     else:
-        correct_intent = predicted_intent
+        correct_intent = ", ".join(chat["predicted"])
 
-    # Save feedback permanently
-    if st.button("Submit Feedback", key="submit_"+user_input):
-        store_feedback(user_input, predicted_intent, correct_intent)
-        update_intent_db(user_input, correct_intent)
-        st.success("✅ Feedback stored and model updated!")
+    if st.button(f"Submit Feedback for '{chat['user']}'", key=f"btn_{chat['user']}"):
+        store_feedback(chat["user"], chat["predicted"], correct_intent)
+        update_intent_db(chat["user"], correct_intent)
+        st.success("✅ Feedback saved successfully!")
 
-# Display chat
-for sender, message in st.session_state.chat_history:
-    if sender == "You":
-        st.markdown(f"**{sender}:** {message}")
-    else:
-        st.markdown(f"**{sender}:** {message}")
+st.markdown("---")
+st.caption("Built with ❤️ using Streamlit, Sentence Transformers, and MongoDB.")
